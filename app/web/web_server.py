@@ -69,8 +69,8 @@ def validate_stock_code(stock_code, market_type='A'):
 
 
 # 检查是否需要初始化数据库
-if USE_DATABASE:
-    init_db()
+#if USE_DATABASE:
+   # init_db()
 
 # 配置Swagger
 SWAGGER_URL = '/api/docs'
