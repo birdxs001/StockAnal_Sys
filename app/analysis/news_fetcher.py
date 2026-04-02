@@ -28,6 +28,7 @@ class DateEncoder(json.JSONEncoder):
             return None
         return super(DateEncoder, self).default(obj)
 
+
 class NewsFetcher:
     def __init__(self, save_dir="data/news"):
         """初始化新闻获取器"""
@@ -41,28 +42,115 @@ class NewsFetcher:
         # 加载已有的新闻哈希
         self._load_existing_hashes()
 
+    def _safe_json_load(self, file_path, default=None):
+        """
+        安全加载JSON文件，自动处理编码问题
+        支持UTF-8、GBK、GB2312、GB18030、Latin1等编码
+        """
+        if not os.path.exists(file_path):
+            return default
+            
+        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'gb18030', 'latin1', 'cp1252']
+        
+        # 首先尝试正常编码
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    return json.load(f)
+            except UnicodeDecodeError:
+                continue
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                logger.warning(f"使用 {encoding} 读取失败: {e}")
+                continue
+        
+        # 如果所有编码都失败，尝试使用 latin1 并替换错误字符
+        try:
+            logger.warning(f"文件 {file_path} 编码异常，尝试强制读取...")
+            with open(file_path, 'r', encoding='latin1', errors='replace') as f:
+                content = f.read()
+            
+            # 清理替换字符和BOM
+            content = content.replace('\ufffd', '').strip().lstrip('\ufeff').lstrip('\ufffe')
+            
+            # 尝试解析JSON
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # 如果解析失败，可能是文件损坏，返回默认值
+                logger.error(f"文件 {file_path} JSON解析失败，可能已损坏")
+                return default
+                
+        except Exception as e:
+            logger.error(f"无法读取文件 {file_path}: {e}")
+            return default
+
+    def _safe_json_save(self, data, file_path):
+        """
+        安全保存JSON文件，使用原子写入防止文件损坏
+        确保文件始终为UTF-8编码
+        """
+        # 确保目录存在
+        os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else '.', exist_ok=True)
+        
+        temp_path = f"{file_path}.tmp"
+        backup_path = f"{file_path}.backup"
+        
+        try:
+            # 先写入临时文件
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, cls=DateEncoder)
+            
+            # 如果原文件存在，先备份
+            if os.path.exists(file_path):
+                try:
+                    os.replace(file_path, backup_path)
+                except:
+                    pass  # 备份失败不影响主流程
+            
+            # 原子替换临时文件为正式文件
+            os.replace(temp_path, file_path)
+            
+            # 清理临时文件（如果存在）
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+        except Exception as e:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            raise e
+
     def _load_existing_hashes(self):
         """加载已有文件中的新闻哈希值"""
         try:
             # 获取最近7天的文件来加载哈希值
             today = datetime.now()
             for i in range(7):  # 检查最近7天的数据
-                date = today - timedelta(days=i)
-                filename = self.get_news_filename(date)
+                check_date = today - timedelta(days=i)
+                filename = self.get_news_filename(check_date)
 
                 if os.path.exists(filename):
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        try:
-                            news_data = json.load(f)
-                            for item in news_data:
-                                # 如果有哈希字段就直接使用，否则计算新的哈希
-                                if 'hash' in item:
-                                    self.news_hashes.add(item['hash'])
-                                else:
-                                    content_hash = self._calculate_hash(item['content'])
-                                    self.news_hashes.add(content_hash)
-                        except json.JSONDecodeError:
-                            logger.warning(f"文件 {filename} 格式错误，跳过加载哈希值")
+                    # 使用安全加载方法
+                    news_data = self._safe_json_load(filename, default=[])
+                    
+                    if not isinstance(news_data, list):
+                        logger.warning(f"文件 {filename} 格式异常（非列表），跳过")
+                        continue
+                        
+                    for item in news_data:
+                        if not isinstance(item, dict):
+                            continue
+                        # 如果有哈希字段就直接使用，否则计算新的哈希
+                        if 'hash' in item:
+                            self.news_hashes.add(item['hash'])
+                        elif 'content' in item:
+                            content_hash = self._calculate_hash(item['content'])
+                            self.news_hashes.add(content_hash)
 
             logger.info(f"已加载 {len(self.news_hashes)} 条新闻哈希值")
 
@@ -88,10 +176,14 @@ class NewsFetcher:
     def get_news_filename(self, date=None):
         """获取指定日期的新闻文件名"""
         if date is None:
-            date = datetime.now().strftime('%Y%m%d')
+            date = datetime.now()
+        
+        if isinstance(date, str):
+            date_str = date
         else:
-            date = date.strftime('%Y%m%d')
-        return os.path.join(self.save_dir, f"news_{date}.json")
+            date_str = date.strftime('%Y%m%d')
+            
+        return os.path.join(self.save_dir, f"news_{date_str}.json")
 
     def fetch_and_save(self):
         """获取新闻并保存到JSON文件，避免重复内容"""
@@ -172,23 +264,22 @@ class NewsFetcher:
 
             # 如果文件已存在，则合并新旧数据
             if os.path.exists(filename):
-                with open(filename, 'r', encoding='utf-8') as f:
-                    try:
-                        existing_data = json.load(f)
-                        # 合并数据，已经确保news_list中的内容都是新的
-                        merged_news = existing_data + news_list
-                        # 按时间排序
-                        merged_news.sort(key=lambda x: x['datetime'], reverse=True)
-                    except json.JSONDecodeError:
-                        logger.warning(f"文件 {filename} 格式错误，使用新数据替换")
-                        merged_news = sorted(news_list, key=lambda x: x['datetime'], reverse=True)
+                existing_data = self._safe_json_load(filename, default=[])
+                
+                if isinstance(existing_data, list):
+                    # 合并数据，已经确保news_list中的内容都是新的
+                    merged_news = existing_data + news_list
+                    # 按时间排序
+                    merged_news.sort(key=lambda x: x.get('datetime', ''), reverse=True)
+                else:
+                    logger.warning(f"现有文件格式异常，使用新数据")
+                    merged_news = sorted(news_list, key=lambda x: x['datetime'], reverse=True)
             else:
                 # 如果文件不存在，直接使用新数据
                 merged_news = sorted(news_list, key=lambda x: x['datetime'], reverse=True)
 
-            # 保存合并后的数据，使用自定义编码器处理日期
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(merged_news, f, ensure_ascii=False, indent=2, cls=DateEncoder)
+            # 保存合并后的数据，使用安全保存方法
+            self._safe_json_save(merged_news, filename)
 
             logger.info(f"成功保存 {new_count} 条新闻数据 (共检查 {total_count} 条，过滤重复 {total_count - new_count} 条)")
             self.last_fetch_time = now
@@ -209,19 +300,20 @@ class NewsFetcher:
 
         # 获取指定天数内的所有新闻
         for i in range(days):
-            date = today - timedelta(days=i)
-            date_str = date.strftime('%Y%m%d')
-            filename = self.get_news_filename(date)
+            check_date = today - timedelta(days=i)
+            date_str = check_date.strftime('%Y%m%d')
+            filename = self.get_news_filename(check_date)
 
             if os.path.exists(filename):
-                try:
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        news_data.extend(data)
-                        processed_dates.append(date_str)
-                        logger.info(f"已加载 {date_str} 新闻数据 {len(data)} 条")
-                except Exception as e:
-                    logger.error(f"读取文件 {filename} 时出错: {str(e)}")
+                # 使用安全加载方法
+                data = self._safe_json_load(filename, default=[])
+                
+                if isinstance(data, list):
+                    news_data.extend(data)
+                    processed_dates.append(date_str)
+                    logger.info(f"已加载 {date_str} 新闻数据 {len(data)} 条")
+                else:
+                    logger.warning(f"文件 {filename} 格式异常（非列表），跳过")
             else:
                 logger.warning(f"日期 {date_str} 的新闻文件不存在: {filename}")
 
@@ -234,6 +326,9 @@ class NewsFetcher:
         duplicate_count = 0
 
         for item in news_data:
+            if not isinstance(item, dict):
+                continue
+                
             # 优先使用已有的哈希值，如果没有则组合标题+内容计算哈希
             item_hash = item.get('hash')
             if not item_hash and 'content' in item:
@@ -259,8 +354,10 @@ class NewsFetcher:
 
         return result
 
+
 # 单例模式的新闻获取器
 news_fetcher = NewsFetcher()
+
 
 def fetch_news_task():
     """执行新闻获取任务"""
@@ -268,16 +365,16 @@ def fetch_news_task():
     news_fetcher.fetch_and_save()
     logger.info("新闻获取任务完成")
 
+
 def start_news_scheduler():
     """启动新闻获取定时任务"""
     import threading
-    import time
 
     def _run_scheduler():
         while True:
             try:
                 fetch_news_task()
-                # 等待10分钟
+                # 等待30分钟（1800秒）
                 time.sleep(1800)
             except Exception as e:
                 logger.error(f"定时任务执行出错: {str(e)}")
@@ -288,6 +385,7 @@ def start_news_scheduler():
     scheduler_thread.daemon = True
     scheduler_thread.start()
     logger.info("新闻获取定时任务已启动")
+
 
 # 初始获取一次数据
 if __name__ == "__main__":
